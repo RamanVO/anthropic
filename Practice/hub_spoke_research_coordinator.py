@@ -2,11 +2,44 @@ from dotenv import load_dotenv
 from anthropic import Anthropic
 import json
 
-from prompt_toolkit import prompt
-
 load_dotenv()
-client = Anthropic()
-model = "claude-haiku-4-5"
+# client = Anthropic()
+# model = "claude-haiku-4-5"
+
+def web_search(query):
+    # Mock search: echoes the query so the loop can be tested on any topic.
+    # Replace with a real search API, or use the server-side web search tool.
+    results = [
+        {"title": f"Overview: {query}",
+         "snippet": f"Mock result for '{query}'. This stub returns no real information."},
+        {"title": f"Recent developments: {query}",
+         "snippet": f"Second mock result for '{query}'."},
+    ]
+    return json.dumps(results)
+
+web_search_tool_schema = {
+    "name": "web_search", 
+    "description": (
+        "Searches the web for information and returns relevant results each with a title and a short snippet. "
+        "Use this tool to find up-to-date information, news, or specific details that are not available in the model's training data."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "A search query string to find relevant information on the web. "
+                    "Examples: 'latest news on climate change', 'Python programming tutorials', 'current stock prices for AAPL'."
+                ),
+                "minLength": 1
+            }
+        },
+        "required": ["query"]
+    }
+}
+
+TOOL_HANDLERS = {"web_search": web_search}
 
 class HubSpokeResearchCoordinator:
     SYSTEM_PROMPT = (
@@ -28,6 +61,7 @@ class HubSpokeResearchCoordinator:
                 "You are a web search agent. Research the subtopic you are given. "
                 'Return JSON only: {"results": [{"title": "...", "snippet": "..."}]}'
             ),
+            "tools": [web_search_tool_schema],
         },
         "document_analysis_agent": {
             "description": "Analyses material to extract key points and summaries on a subtopic.",
@@ -35,6 +69,7 @@ class HubSpokeResearchCoordinator:
                 "You are a document analysis agent. Analyse the material you are given. "
                 'Return JSON only: {"analysis": [{"key_point": "...", "summary": "..."}]}'
             ),
+            "tools": [],   # analyses what the coordinator passes it; no searching of its own
         }
     }
 
@@ -47,6 +82,7 @@ class HubSpokeResearchCoordinator:
     
     def research(self, topic, required_areas=None):
         subtopics = self.decompose(topic, required_areas)
+        subtopics=subtopics[:2]
         results = self.delegate(topic, subtopics)
         coverage = self.evaluate_coverage(topic, subtopics, results)
 
@@ -96,8 +132,8 @@ class HubSpokeResearchCoordinator:
             f"Decompose the following research topic into at least 5 distinct, non-overlapping subtopics:\n"
             f"Topic: {topic}\n"
             f"Once you have identified the subtopics, review the subtopics silently again and ensure no area is missing.\n"
-            f"A subtopic must cover exactly one type. Never combines two types with 'and' or '/'\n"
-            f"Update the list of subtopics if necessary. Return the final list of subtopics with only the JSON array, with no other text”.\n"
+            f"A subtopic must cover exactly one type. Combine two types with 'and' or '/'\n"
+            f"Update the list of subtopics if necessary. Return the final list of subtopics with only the JSON array, with no other text.\n"
         )
         first_list= self._ask_coordinator(first_prompt)
         # print(f"Initial subtopics: {first_list}")
@@ -192,16 +228,53 @@ class HubSpokeResearchCoordinator:
             "coverage": coverage
         }
 
+    MAX_TOOL_ITERATIONS = 5 
     def _call_subagent(self, agent_name, prompt):
         agent_info = self.SUBAGENTS[agent_name]
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=4096,
-            system=agent_info["system_prompt"],
-            messages=[{"role": "user", "content": prompt}]
-        )
-        content = "\n".join([block.text for block in response.content if block.type == "text"])
-        return self._parse_json(content)
+        messages = [{"role": "user", "content": prompt}]
+
+        for _ in range(self.MAX_TOOL_ITERATIONS):
+            request={
+                "model": self.model,
+                "max_tokens": 4096,
+                "system": agent_info["system_prompt"],
+                "messages": messages                
+            }
+            if agent_info["tools"]:
+                request["tools"] = agent_info["tools"]
+            response = self.client.messages.create(**request)
+
+            if response.stop_reason == "end_turn":
+                content = "\n".join([block.text for block in response.content if block.type == "text"])
+                return self._parse_json(content)
+
+            if response.stop_reason == "tool_use":
+                messages.append({"role": "assistant", "content": response.content})
+                tool_results = []
+                for block in response.content:
+                    if block.type != "tool_use":
+                        continue
+                    handler = TOOL_HANDLERS.get(block.name)
+                    try:
+                        if handler is None:
+                            raise ValueError(f"unknown tool '{block.name}'")
+                        output, is_error= handler(**block.input), False 
+                    except Exception as e:
+                        output, is_error = f"Error: {str(e)}", True
+
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": output,
+                        "is_error": is_error
+                    })
+                messages.append({"role": "user", "content": tool_results})
+                continue
+            if response.stop_reason == "max_tokens":
+                raise RuntimeError(f"Subagent {agent_name} reached max tokens without completing the task.")
+            raise RuntimeError(f"{agent_name} Unexpected stop reason: {response.stop_reason}")
+        raise RuntimeError(f"Subagent {agent_name} exceeded max tool iterations ({self.MAX_TOOL_ITERATIONS}) without completing the task.")
+
 
     MIN_SEARCH_RESULTS = 3
     def evaluate_coverage(self, topic, subtopics,results):
@@ -239,9 +312,9 @@ class HubSpokeResearchCoordinator:
             for st in to_judge:
                 coverage[st] = verdict.get(st, {"status": "superficial", "reason": "No verdict provided"})
 
-            gaps= {st: info for st, info in coverage.items() if info["status"] != "substantive"}
-            completeness= (len(subtopics) - len(gaps))/len(subtopics) if subtopics else 0
-            return {"coverage": coverage, "gaps": gaps, "completeness": completeness}
+        gaps= {st for st, info in coverage.items() if info["status"] != "substantive"}
+        completeness= (len(subtopics) - len(gaps))/len(subtopics) if subtopics else 0
+        return {"coverage": coverage, "gaps": gaps, "completeness": completeness}
         
 
 if __name__ == "__main__":
