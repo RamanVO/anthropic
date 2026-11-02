@@ -56,12 +56,16 @@ class HubSpokeResearchCoordinator:
     )
     SUBAGENTS = {
         "web_search_agent": {
-            "description": "Finds current information, news and sources on a subtopic.",
+            "description": "Finds current information and sources on a subtopic.",
             "system_prompt": (
-                "You are a web search agent. Research the subtopic you are given. "
-                'Return JSON only: {"results": [{"title": "...", "snippet": "..."}]}'
+                "You are a web search agent. Use the web_search tool to research the subtopic "
+                "you are given. Include only pages the tool actually returned, with their exact URL, "
+                "and summarise each page in your own words. "
+                'When finished, reply with JSON only: '
+                '{"results": [{"title": "...", "url": "...", "snippet": "..."}], "notes": "..."} '
+                "Put any comments about the search itself in notes, never in results."
             ),
-            "tools": [web_search_tool_schema],
+            "tools": [{"type": "web_search_20260209", "name": "web_search", "max_uses": 5, "allowed_callers":["direct"]}],
         },
         "document_analysis_agent": {
             "description": "Analyses material to extract key points and summaries on a subtopic.",
@@ -124,7 +128,14 @@ class HubSpokeResearchCoordinator:
             text = text.rsplit("```", 1)[0]     # drop the closing ```
         return json.loads(text)
 
-
+    @staticmethod
+    def _final_text(response):
+        # Use only the text after the last search result, so "I'll search for..." isn't included.
+        # Join with "" because citations can split one answer across several text blocks.
+        last=max((i for i, b in enumerate(response.content) if b.type=="web_search_tool_result"), default=-1)
+        text="".join(b.text for b in response.content[last+1:] if b.type=="text")
+        start, end= text.find("{"), text.rfind("}")
+        return text[start:end+1] if start != -1 else text
     
     def decompose(self, topic, required_areas=None):
         # Phase 1: Use the model to decompose the topic into subtopics
@@ -198,11 +209,21 @@ class HubSpokeResearchCoordinator:
             )
 
         search_prompt+= (
-            'Return JSON only: {"results": [{"title": "...", "snippet": "..."}]}\n'
+            'Return JSON only: {"results": [{"title": "...", "url": "...", "snippet": "..."}], "notes": "..."}\n'
         )
 
-        new = self._call_subagent("web_search_agent", search_prompt).get("results", [])
-        combined = prior + new
+        # new = self._call_subagent("web_search_agent", search_prompt).get("results", [])
+        # combined = prior + new
+        # search_store[subtopic] = {"results": combined}
+        output= self._call_subagent("web_search_agent", search_prompt)
+        sources=output.pop("_sources", {})
+        claimed=output.get("results", [])
+        new= [r for r in claimed if r.get("url") in sources]
+        if(len(new) < len(claimed)):
+            print(f"WARNING: dropped {len(claimed) - len(new)} unverified results for '{subtopic}'")
+
+        seen_urls={r.get("url") for r in prior}
+        combined= prior + [r for r in new if r.get("url") not in seen_urls]
         search_store[subtopic] = {"results": combined}
 
         # Analysis: re-run over ALL results, so the analysis reflects the full picture
@@ -216,7 +237,10 @@ class HubSpokeResearchCoordinator:
             '{"analysis": [{"key_point": "...", "summary": "..."}]}\n'
         )
 
-        analysis_store[subtopic] = self._call_subagent("document_analysis_agent", analysis_prompt)
+        analysis_output  = self._call_subagent("document_analysis_agent", analysis_prompt)
+        analysis_output.pop("_sources", None)
+        analysis_store[subtopic] = analysis_output
+        
 
 
     def aggregate(self, topic, results, coverage):
@@ -232,6 +256,7 @@ class HubSpokeResearchCoordinator:
     def _call_subagent(self, agent_name, prompt):
         agent_info = self.SUBAGENTS[agent_name]
         messages = [{"role": "user", "content": prompt}]
+        sources={}
 
         for _ in range(self.MAX_TOOL_ITERATIONS):
             request={
@@ -244,9 +269,24 @@ class HubSpokeResearchCoordinator:
                 request["tools"] = agent_info["tools"]
             response = self.client.messages.create(**request)
 
+            # Record every page the search tool really returned, and surface search errors
+            for block in response.content:
+                if block.type=="web_search_tool_result":
+                    if isinstance(block.content, list):
+                        for item in block.content:
+                            sources[item.url]= item.title
+                    else:
+                        print(f"WARNING: search error: {getattr(block.content, 'error_code', block.content)}")
+
             if response.stop_reason == "end_turn":
-                content = "\n".join([block.text for block in response.content if block.type == "text"])
-                return self._parse_json(content)
+                #content = "\n".join([block.text for block in response.content if block.type == "text"])
+                parsed=self._parse_json(self._final_text(response))
+                parsed["_sources"]=sources
+                return parsed
+
+            if response.stop_reason == "pause_turn":
+                messages.append({"role": "assistant", "content": response.content})
+                continue
 
             if response.stop_reason == "tool_use":
                 messages.append({"role": "assistant", "content": response.content})
@@ -270,6 +310,7 @@ class HubSpokeResearchCoordinator:
                     })
                 messages.append({"role": "user", "content": tool_results})
                 continue
+            
             if response.stop_reason == "max_tokens":
                 raise RuntimeError(f"Subagent {agent_name} reached max tokens without completing the task.")
             raise RuntimeError(f"{agent_name} Unexpected stop reason: {response.stop_reason}")
@@ -324,3 +365,6 @@ if __name__ == "__main__":
     summary = coordinator.research(topic,required_areas=["solar", "wind", "geothermal", "tidal", "biomass", "fusion"])
     print(summary)
     
+
+
+
