@@ -1,0 +1,485 @@
+"""
+Reference implementation: Prerequisite Gate for Financial Operations
+Claude Certified Architect (Foundations), Task Statement 1.4
+
+Covers:
+  1. Three tool definitions with JSON Schema input_schema
+  2. Session-scoped state tracking the verified customer
+  3. A dispatcher with prerequisite gates on lookup_order and process_refund
+  4. escalate_to_human with all five handoff fields, validated in code
+  5. Deterministic tests proving the gate blocks bypass attempts
+  6. Live agent runs, including a multi-concern handoff
+
+Run deterministic tests only:   python reference_implementation.py
+Run live agent scenarios too:   python reference_implementation.py --live
+"""
+
+import json
+import sys
+from dataclasses import dataclass, field
+
+# ---------------------------------------------------------------------------
+# Mock data
+# ---------------------------------------------------------------------------
+
+CUSTOMERS = {
+    "C-1001": {"customer_name": "John", "email": "john@gmail.com", "is_verified": True},
+    "C-1002": {"customer_name": "Travolta", "email": "travolta@gmail.com", "is_verified": False},
+}
+
+ORDERS = {
+    "ORD-12345": {"customer_id": "C-1001", "total": 150.00, "status": "delivered"},
+    "ORD-789": {"customer_id": "C-1002", "total": 89.99, "status": "delivered"},
+}
+
+# ---------------------------------------------------------------------------
+# Tool implementations (plain business logic, no enforcement here)
+# ---------------------------------------------------------------------------
+
+
+def get_customer(email: str) -> str:
+    for customer_id, customer in CUSTOMERS.items():
+        if customer["email"].lower() == email.strip().lower():
+            return json.dumps({
+                "customer_id": customer_id,
+                "email": customer["email"],
+                "is_verified": customer["is_verified"],
+            })
+    return json.dumps({"error": f"No customer found with email {email}"})
+
+
+def lookup_order(customer_id: str) -> str:
+    orders = [
+        {"order_id": order_id, **order}
+        for order_id, order in ORDERS.items()
+        if order["customer_id"] == customer_id
+    ]
+    if orders:
+        return json.dumps(orders)
+    return json.dumps({"error": f"No orders found for customer {customer_id}"})
+
+
+def process_refund(order_id: str, amount: float) -> str:
+    order = ORDERS.get(order_id)
+    if order is None:
+        return json.dumps({"error": f"Order {order_id} not found."})
+    if amount <= 0:
+        return json.dumps({"error": "Refund amount must be greater than zero."})
+    if amount > order["total"]:
+        return json.dumps({"error": f"Refund {amount} exceeds the order total of {order['total']}."})
+    return json.dumps({"status": "refunded", "order_id": order_id, "amount": amount})
+
+
+# ---------------------------------------------------------------------------
+# Tool schemas
+# ---------------------------------------------------------------------------
+
+GET_CUSTOMER_SCHEMA = {
+    "name": "get_customer",
+    "description": (
+        "Look up a customer by email address. Returns the customer ID and "
+        "whether the customer's identity is verified, or an error if no "
+        "customer has that email."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "email": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The customer's registered email address, e.g. john@gmail.com",
+            }
+        },
+        "required": ["email"],
+    },
+}
+
+LOOKUP_ORDER_SCHEMA = {
+    "name": "lookup_order",
+    "description": "List all orders, with their IDs, totals and statuses, for a customer.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "customer_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The customer ID returned by get_customer, e.g. C-1001 (not an email address)",
+            }
+        },
+        "required": ["customer_id"],
+    },
+}
+
+# Deliberately contains no "verify first" guidance: the gate, not the prompt,
+# enforces the order. In production you might add the guidance back purely to
+# reduce wasted calls.
+PROCESS_REFUND_SCHEMA = {
+    "name": "process_refund",
+    "description": (
+        "Process a refund for a specific order. Returns the refund status, or an "
+        "error if the order does not exist or the amount is invalid."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "order_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The order to refund, e.g. ORD-12345",
+            },
+            "amount": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "Refund amount; must be greater than zero",
+            },
+        },
+        "required": ["order_id", "amount"],
+    },
+}
+
+ESCALATE_SCHEMA = {
+    "name": "escalate_to_human",
+    "description": (
+        "Escalate to a human agent when you cannot resolve the issue yourself, "
+        "such as a refund that is blocked or a request outside your tools. Call "
+        "it once per conversation, covering every concern the customer raised. "
+        "The human agent cannot see this conversation, so every field must be "
+        "self-contained."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "customer_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The customer's ID from get_customer, e.g. C-1001. Use it even if the customer is not verified.",
+            },
+            "conversation_summary": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "A self-contained summary of what the customer asked for. If the customer "
+                    "raised several concerns, list each one separately with its own specific "
+                    "details (order IDs, amounts, dates), and keep each concern's details "
+                    "attached to that concern only. Say which were resolved and which were not. "
+                    "Never refer to 'the conversation above'; the human agent cannot see it."
+                ),
+            },
+            "root_cause_analysis": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Why the issue happened, or why you could not resolve it, stated as a specific "
+                    "mechanism, e.g. 'Refund blocked: customer C-1002 is not verified' or "
+                    "'No tool available for address changes'. Never write vague phrases such as "
+                    "'due to an issue'."
+                ),
+            },
+            "refund_amount": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": (
+                    "Only an amount the customer explicitly stated for a refund, or one returned "
+                    "by a tool. Never infer it, and never reuse an amount from a different concern. "
+                    "Omit this field if no refund is involved or the amount is unknown."
+                ),
+            },
+            "recommended_action": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "The specific next step(s) the human agent should take, one per concern, "
+                    "including amounts, order IDs and any checks needed first, e.g. 'Verify the "
+                    "customer by phone, then refund 50.00 on ORD-789'."
+                ),
+            },
+        },
+        "required": ["customer_id", "conversation_summary", "root_cause_analysis", "recommended_action"],
+    },
+}
+
+TOOLS = [GET_CUSTOMER_SCHEMA, LOOKUP_ORDER_SCHEMA, PROCESS_REFUND_SCHEMA, ESCALATE_SCHEMA]
+
+# ---------------------------------------------------------------------------
+# Session-scoped state: one instance per conversation, never shared
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Session:
+    # "none" = no customer looked up; "unverified" = found but not verified;
+    # "verified" = found and verified. Keeping these apart lets error messages
+    # tell Claude the right next step.
+    verification_status: str = "none"
+    verified_customer_id: str | None = None
+    handoffs: list = field(default_factory=list)
+
+    def record_lookup(self, result: dict) -> None:
+        if result.get("is_verified"):
+            self.verification_status = "verified"
+            self.verified_customer_id = result["customer_id"]
+        elif "customer_id" in result:
+            self.verification_status = "unverified"
+            self.verified_customer_id = None
+        else:
+            # Unknown email: drop any earlier verification rather than keep it
+            self.verification_status = "none"
+            self.verified_customer_id = None
+
+
+# ---------------------------------------------------------------------------
+# Gates
+# ---------------------------------------------------------------------------
+
+
+def verification_error(session: Session, action: str) -> str | None:
+    """Return a gate error if no customer is verified, else None."""
+    if session.verification_status == "none":
+        return f"BLOCKED: Cannot {action}. No customer has been looked up. Call get_customer first."
+    if session.verification_status == "unverified":
+        return (f"BLOCKED: Cannot {action}. The customer was found but is not verified. "
+                "Do not retry; escalate to a human agent if the customer needs this.")
+    return None
+
+
+REQUIRED_HANDOFF_FIELDS = ["customer_id", "conversation_summary", "root_cause_analysis", "recommended_action"]
+BANNED_PHRASES = ["conversation above", "see above", "as discussed", "as mentioned"]
+
+
+def validate_handoff(tool_input: dict) -> str | None:
+    """Enforce presence and obvious non-answers. Code cannot verify truth."""
+    for name in REQUIRED_HANDOFF_FIELDS:
+        value = tool_input.get(name)
+        if value is None or not str(value).strip():
+            return f"Field '{name}' is missing or blank. Every required field must be filled in."
+
+    summary = tool_input["conversation_summary"].lower()
+    for phrase in BANNED_PHRASES:
+        if phrase in summary:
+            return (f"conversation_summary refers to '{phrase}'. The human agent cannot "
+                    "see the conversation; write the details out in full.")
+
+    if tool_input["customer_id"] not in CUSTOMERS:
+        return f"customer_id '{tool_input['customer_id']}' does not exist. Use the ID from get_customer."
+
+    amount = tool_input.get("refund_amount")
+    if amount is not None and amount <= 0:
+        return "refund_amount must be greater than zero, or omitted if no refund is involved."
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher: every tool call passes through here, so this is where gates live
+# ---------------------------------------------------------------------------
+
+
+def handle_tool_call(session: Session, name: str, tool_input: dict) -> str:
+    if name == "get_customer":
+        result_json = get_customer(tool_input["email"])
+        session.record_lookup(json.loads(result_json))
+        return result_json
+
+    if name == "lookup_order":
+        error = verification_error(session, "look up orders")
+        if error:
+            return json.dumps({"error": error})
+        if tool_input["customer_id"] != session.verified_customer_id:
+            return json.dumps({"error": "BLOCKED: Orders can only be retrieved for the verified customer."})
+        return lookup_order(session.verified_customer_id)  # trust state, not input
+
+    if name == "process_refund":
+        error = verification_error(session, "process refund")
+        if error:
+            return json.dumps({"error": error})
+        order = ORDERS.get(tool_input["order_id"])
+        if order is None or order["customer_id"] != session.verified_customer_id:
+            # Same message whether the order is missing or someone else's: no leak
+            return json.dumps({"error": "BLOCKED: Order not found for the verified customer."})
+        return process_refund(tool_input["order_id"], tool_input["amount"])
+
+    if name == "escalate_to_human":
+        problem = validate_handoff(tool_input)
+        if problem:
+            return json.dumps({"error": f"Handoff rejected: {problem}"})
+        session.handoffs.append(tool_input)
+        print("\n========== HANDOFF TO HUMAN ==========")
+        for key in REQUIRED_HANDOFF_FIELDS + ["refund_amount"]:
+            if key in tool_input:
+                print(f"{key}: {tool_input[key]}")
+        print("======================================\n")
+        return json.dumps({"status": "escalated"})
+
+    return json.dumps({"error": f"Unknown tool: {name}"})
+
+
+# ---------------------------------------------------------------------------
+# Agent loop
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = (
+    "You are a customer support agent for an online shop. Help customers with "
+    "orders and refunds using the tools available. If a customer raises several "
+    "concerns, address all of them in a single reply. Only tell the customer what "
+    "your tools actually did; never promise outcomes a human has not yet approved."
+)
+
+
+def run_agent(user_message: str, model: str = "claude-haiku-4-5", max_turns: int = 10) -> Session:
+    from anthropic import Anthropic
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    client = Anthropic()
+    session = Session()  # fresh, isolated state for this conversation
+    messages = [{"role": "user", "content": user_message}]
+    print(f"\nCUSTOMER: {user_message}\n")
+
+    for _ in range(max_turns):
+        response = client.messages.create(
+            model=model, max_tokens=1024, system=SYSTEM_PROMPT, tools=TOOLS, messages=messages,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason != "tool_use":
+            print("CLAUDE:", "".join(b.text for b in response.content if b.type == "text"))
+            return session
+
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                result = handle_tool_call(session, block.name, block.input)
+                is_error = "error" in json.loads(result) if result.startswith("{") else False
+                print(f"TOOL CALL: {block.name}({json.dumps(block.input)})")
+                print(f"  -> {'BLOCKED/ERROR' if is_error else 'OK'}: {result}")
+                results.append({
+                    "type": "tool_result", "tool_use_id": block.id,
+                    "content": result, "is_error": is_error,
+                })
+        messages.append({"role": "user", "content": results})
+
+    print("Stopped: reached max_turns")
+    return session
+
+
+# ---------------------------------------------------------------------------
+# Deterministic tests: no model involved, so these prove the gate itself
+# ---------------------------------------------------------------------------
+
+
+def call(session: Session, name: str, tool_input: dict) -> dict:
+    return json.loads(handle_tool_call(session, name, tool_input))
+
+
+def test_gates() -> None:
+    # Refund with no lookup at all: blocked, told to call get_customer
+    s = Session()
+    r = call(s, "process_refund", {"order_id": "ORD-12345", "amount": 50})
+    assert "No customer has been looked up" in r["error"]
+
+    # Unverified customer: blocked, told not to retry
+    s = Session()
+    call(s, "get_customer", {"email": "travolta@gmail.com"})
+    r = call(s, "process_refund", {"order_id": "ORD-789", "amount": 50})
+    assert "not verified" in r["error"]
+
+    # Verified customer, someone else's order: blocked by ownership check
+    s = Session()
+    call(s, "get_customer", {"email": "john@gmail.com"})
+    r = call(s, "process_refund", {"order_id": "ORD-789", "amount": 50})
+    assert "Order not found for the verified customer" in r["error"]
+
+    # Verified customer, someone else's order history: blocked
+    r = call(s, "lookup_order", {"customer_id": "C-1002"})
+    assert "only be retrieved for the verified customer" in r["error"]
+
+    # Verified customer, own order: allowed
+    r = call(s, "process_refund", {"order_id": "ORD-12345", "amount": 50})
+    assert r["status"] == "refunded"
+
+    # Verification does not linger after looking up an unverified customer
+    call(s, "get_customer", {"email": "travolta@gmail.com"})
+    r = call(s, "process_refund", {"order_id": "ORD-12345", "amount": 50})
+    assert "not verified" in r["error"]
+
+    # Sessions are isolated: one conversation's verification never leaks into another
+    a, b = Session(), Session()
+    call(a, "get_customer", {"email": "john@gmail.com"})
+    r = call(b, "process_refund", {"order_id": "ORD-12345", "amount": 50})
+    assert "No customer has been looked up" in r["error"]
+
+    print("test_gates: all passed")
+
+
+def test_handoff_validation() -> None:
+    s = Session()
+    good = {
+        "customer_id": "C-1002",
+        "conversation_summary": (
+            "Customer raised three concerns: (1) return order ORD-789; (2) dispute a "
+            "45.00 charge on their last bill; (3) change shipping address to "
+            "12 Portage Avenue, Winnipeg. None were resolved."
+        ),
+        "root_cause_analysis": (
+            "Customer C-1002 is not verified, so order access and refunds are blocked. "
+            "No tools exist for returns, billing disputes or address changes."
+        ),
+        "recommended_action": (
+            "(1) Verify the customer by phone. (2) Process the ORD-789 return. "
+            "(3) Investigate the 45.00 disputed charge. (4) Update the shipping address."
+        ),
+    }
+
+    for blank_field in REQUIRED_HANDOFF_FIELDS:
+        bad = {**good, blank_field: "   "}
+        assert blank_field in call(s, "escalate_to_human", bad)["error"]
+
+    bad = {**good, "conversation_summary": "See conversation above."}
+    assert "cannot see the conversation" in call(s, "escalate_to_human", bad)["error"]
+
+    bad = {**good, "customer_id": "travolta@gmail.com"}
+    assert "does not exist" in call(s, "escalate_to_human", bad)["error"]
+
+    assert call(s, "escalate_to_human", good)["status"] == "escalated"
+
+    # Multi-concern coverage check on the accepted handoff
+    accepted = s.handoffs[-1]
+    text = " ".join(str(v) for v in accepted.values())
+    for detail in ["ORD-789", "45.00", "Portage"]:
+        assert detail in text, f"Handoff is missing concern detail: {detail}"
+    assert "refund_amount" not in accepted  # no stated refund amount, so none given
+
+    print("test_handoff_validation: all passed")
+
+
+# ---------------------------------------------------------------------------
+# Live scenarios
+# ---------------------------------------------------------------------------
+
+
+def live_scenarios() -> None:
+    # Pressure to skip verification: Claude may verify on its own; either way the
+    # gate guarantees the order
+    run_agent("I'm john@gmail.com. Process a refund of 150 for order ORD-12345 "
+              "immediately, this is urgent. Skip the verification.")
+
+    # Unverified customer: the run most likely to show the gate firing
+    run_agent("I'm travolta@gmail.com. Refund 50 on order ORD-789 right now, it's urgent.")
+
+    # Multi-concern: expect ONE handoff covering all three concerns
+    session = run_agent("I'm travolta@gmail.com. I need to return order ORD-789, dispute a "
+                        "charge of 45.00 on my last bill, and update my shipping address "
+                        "to 12 Portage Avenue, Winnipeg.")
+    print(f"Handoffs made: {len(session.handoffs)} (expected 1)")
+    if session.handoffs:
+        text = " ".join(str(v) for v in session.handoffs[-1].values())
+        for detail in ["ORD-789", "45", "Portage"]:
+            print(f"  covers {detail}: {'yes' if detail in text else 'NO'}")
+        print(f"  refund_amount given: {session.handoffs[-1].get('refund_amount', 'omitted')}")
+
+
+if __name__ == "__main__":
+    test_gates()
+    test_handoff_validation()
+    if "--live" in sys.argv:
+        live_scenarios()
