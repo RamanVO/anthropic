@@ -40,7 +40,8 @@ web_search_agent = AgentDefinition(
         "Ensure that the information you provide is accurate and relevant to the subtopic. "
         "Do not include any personal opinions or unrelated information. "
     ),
-    tools=["WebSearch", "WebFetch"]
+    tools=["WebSearch", "WebFetch"],
+    model = "claude-haiku-4-5"
 )
 
 document_analysis_agent = AgentDefinition(
@@ -53,7 +54,8 @@ document_analysis_agent = AgentDefinition(
         "Ensure that the information you provide is accurate and relevant to the subtopic. "
         "Do not include any personal opinions or unrelated information. "
     ),
-    tools=["Glob","Read"]
+    tools=["Glob","Read"],
+    model = "claude-haiku-4-5"
 )
 
 synthesis_agent = AgentDefinition(
